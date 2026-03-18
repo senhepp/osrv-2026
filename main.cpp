@@ -1,190 +1,187 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <pthread.h>
-
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <memory>
+#include <cstring>
+#include <thread>
+#include <barrier>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
-#include <sys/mman.h>
-
-#include <string.h>
 #include <fcntl.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <cstdint>
 #include <limits.h>
 
+using u64 = std::uint64_t;
+using u8 = std::uint8_t;
+
 struct InputData {
-    char inputFile[PATH_MAX + 1];
-    char outputFile[PATH_MAX + 1];
-
-    size_t size;
-
-    uint64_t x0;
-    uint64_t a;
-    uint64_t c;
-    uint64_t m;
-
-    char *bloknot;
+    std::string inputFile;
+    std::string outputFile;
+    size_t fileSize = 0;
+    u64 x0 = 0;
+    u64 a = 0;
+    u64 c = 0;
+    u64 m = 0;
+    std::unique_ptr<u8[]> bloknot;
 };
 
-struct Context {
-    pthread_t id,
-    pthread_barrier_t* barrier;
-
-    size_t start{};
-    size_t end{};
-    size_t length{};
-    char*  bloknot{};
-    char*  input{};
-    char*  output{};
+struct WorkerContext {
+    std::barrier<> *barrier;
+    const u8 *input;
+    u8 *bloknot;
+    u8 *output;
+    size_t start = 0;
+    size_t end = 0;
 };
 
-int getRand(int *arg) {
-    auto* inp = static_cast<InputData*>(arg);
-    uint64_t x = inp->x0;
-    uint64_t a = inp->a;
-    uint64_t c = inp->c;
-    uint64_t m = inp->m;
-    for (size_t i = 0; i < inp->size; ++i) {
-        inp->bloknot[i] = static_cast<char>(x);
-        x = (a * x + c) % m;
+void generateBloknot(InputData& data) {
+    u64 x = data.x0;
+    auto* bloknot = data.bloknot.get();
+    for (size_t i = 0; i < data.fileSize; ++i) {
+        bloknot[i] = static_cast<u8>(x);
+        x = (data.a * x + data.c) % data.m;
     }
-    return nullptr;
 }
 
-void *worker(void *arg) {
-    auto* ctx = static_cast<Context*>(arg);
-    for (size_t i = ctx->start; i < ctx->end; ++i) {
-        ctx->output[i] = ctx->input[i] ^ ctx->bloknot[i];
+void workerThread(WorkerContext ctx) {
+    for (size_t i = ctx.start; i < ctx.end; ++i) {
+        ctx.output[i] = ctx.input[i] ^ ctx.bloknot[i];
     }
-    pthread_barrier_wait(ctx->barrier);
-    return nullptr;
+    ctx.barrier->arrive_and_wait();
 }
 
-int main(int argc, char *argv[])
-{
-    // otp  -i /path/to/text.txt -o -/path/to/cypher.txt -x 4212 -a 84589 -c 45989 -m 217728
+std::vector<WorkerContext> createWorkerContexts(
+    size_t fileSize, 
+    int numWorkers,
+    const u8* input, 
+    u8* bloknot, 
+    u8* output,
+    std::barrier<>* barrier
+) {
+    std::vector<WorkerContext> contexts(numWorkers);
+    size_t blockSize = fileSize / numWorkers;
+    
+    for (int i = 0; i < numWorkers; ++i) {
+        contexts[i].barrier = barrier;
+        contexts[i].input = input;
+        contexts[i].bloknot = bloknot;
+        contexts[i].output = output;
+        
+        contexts[i].start = i * blockSize;
+        if (i == numWorkers - 1) {
+            contexts[i].end = fileSize;
+        } else {
+            contexts[i].end = (i + 1) * blockSize;
+        }
+    }
+    return contexts;
+}
 
-    InputData inpData;
+int main(int argc, char* argv[]) {
+    InputData data;
     int opt;
 
     while ((opt = getopt(argc, argv, "i:o:x:a:c:m:")) != -1) {
         switch (opt) {
-        case 'i':
-            inpData.inputFile = optarg;
-            break;
-        case 'o':
-            inpData.outFile = optarg;
-            break;
-        case 'x':
-            inpData.x0 = atoi(optarg);
-            break;
-        case 'a':
-            inpData.a = atoi(optarg);
-            break;
-        case 'c':
-            inpData.c = atoi(optarg);
-            break;
-        case 'm':
-            inpData.m = atoi(optarg);
-            break;
-        default:
-            fprintf(stderr, "no valid argument\n");
-            return nullptr;
+            case 'i':
+                data.inputFile = optarg;
+                break;
+            case 'o':
+                data.outputFile = optarg;
+                break;
+            case 'x':
+                data.x0 = std::atoll(optarg);
+                break;
+            case 'a':
+                data.a = std::atoll(optarg);
+                break;
+            case 'c':
+                data.c = std::atoll(optarg);
+                break;
+            case 'm':
+                data.m = std::atoll(optarg);
+                break;
+            default:
+                return EXIT_FAILURE;
         }
     }
 
-    int ifd;
-    int ofd;    
-
-    fseek(file, 0, SEEK_END);
-    long fileSize = ftell(file);
-    rewind(file);
-
-    unsigned char *buffer = (unsigned char*)malloc(fileSize);
-    if (buffer == NULL) {
-        perror("error allocating memory");
+    int inputFd = open(data.inputFile.c_str(), O_RDONLY);
+    if (inputFd == -1) {
+        perror("Ошибка открытия входного файла");
         return EXIT_FAILURE;
     }
 
-    size_t bytesRead = fread(buffer, 1, fileSize, file);
-    if (bytesRead != fileSize) {
-        perror("error reading file");
+    struct stat statbuf;
+    if (fstat(inputFd, &statbuf) == -1) {
+        perror("Ошибка получения размера файла");
+        close(inputFd);
         return EXIT_FAILURE;
     }
 
-    free(buffer);
-
-    if ((ifd = open(InputData.inputFile, O_RDONLY)) == -1) {
-        perror("input file");
-        return EXIT_FAILURE;
-    }
-    if ((ofd = open(InputData.ofile, O_WRONLY | O_CREAT, S_IREAD | S_IWRITE)) == -1) {
-        perror("output file");
+    data.fileSize = statbuf.st_size;
+    if (data.fileSize == 0) {
+        std::cerr << "Файл пуст";
+        close(inputFd);
         return EXIT_FAILURE;
     }
 
-    struct stat istat;
-    if (fstat(ifd, &istat) == -1) {
-        perror("input file");
+    u8* inputData = static_cast<u8*>(
+        mmap(nullptr, data.fileSize, PROT_READ, MAP_PRIVATE, inputFd, 0)
+    );
+    if (inputData == MAP_FAILED) {
+        perror("Ошибка mmap входного файла");
+        close(inputFd);
         return EXIT_FAILURE;
     }
-    inpData.size = (size_t)istat.st_size;
+    close(inputFd);
 
-    char *input = mmap(NULL, InputData.size, PROT_READ, MAP_PRIVATE, ifd, 0);
-    if (input == MAP_FAILED) {
-        perror("input file");
+    data.bloknot = std::make_unique<u8[]>(data.fileSize);
+    auto outputData = std::make_unique<u8[]>(data.fileSize);
+    generateBloknot(data);
+
+    int numWorkers = std::min(static_cast<int>(get_nprocs()), 64);
+    
+    auto barrier = std::barrier<>(numWorkers + 1);
+    auto contexts = createWorkerContexts(
+        data.fileSize, numWorkers, inputData, 
+        data.bloknot.get(), outputData.get(), &barrier
+    );
+    
+    std::vector<std::thread> workers;
+    workers.reserve(numWorkers);
+
+    for (auto& ctx : contexts) {
+        workers.emplace_back(workerThread, std::move(ctx));
+    }
+
+    barrier.arrive_and_wait();
+
+    int outputFd = open(data.outputFile.c_str(), 
+                       O_WRONLY | O_CREAT | O_TRUNC, 
+                       S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (outputFd == -1) {
+        perror("Ошибка создания выходного файла");
+        munmap(inputData, data.fileSize);
         return EXIT_FAILURE;
     }
-    char *output = calloc(sizeof(char), inpData.size);
 
-    close(ifd);
+    ssize_t bytesWritten = write(outputFd, outputData.get(), data.fileSize);
+    close(outputFd);
 
-    if ((inpData.bloknot = calloc(sizeof(char), inpData.size)) == NULL) {
-        perror("bloknot error");
+    if (bytesWritten != static_cast<ssize_t>(data.fileSize)) {
+        perror("Ошибка записи в выходной файл");
         return EXIT_FAILURE;
     }
 
-    pthread_t th_getRand;
-    if (pthread_create(&th_getRand, NULL, getRand, (void*) &inpData) != 0) {
-        return EXIT_FAILURE;
+    for (auto& t : workers) {
+        t.join();
     }
-    pthread_join(th_lcg_gen, NULL);
-
-    int workers_count = get_nprocs();
-    Context **workers = calloc(sizeof(Context*), workers_count);
-    size_t avg_block_len = inpData.size / workers_count; 
-
-    pthread_barrier_t barrier;
-    if (pthread_barrier_init(&barrier, NULL, workers_count + 1) != 0) {
-        return EXIT_FAILURE;
-    }
-
-    for (int i = 0; i < workers_count; i++) {
-        workers[i] = calloc(sizeof(Context), 1);
-        workers[i]->barrier = &barrier;
-        workers[i]->bloknot = inpData.bloknot;
-        workers[i]->input = input;
-        workers[i]->output = output;
-        workers[i]->start = i * avg_block_len;
-        if (i == workers_count - 1) {
-            workers[i]->end = inpData.size;
-        } else {
-            workers[i]->end = (i + 1) * avg_block_len;
-        }
-        workers[i]->length = workers[i]->end - workers[i]->start;
-        pthread_create(&workers[i]->id, NULL, worker, (void*)workers[i]);
-    }
-
-    pthread_barrier_wait(&barrier);
-    pthread_barrier_destroy(&barrier);
-    munmap(input, inpData.size);
-
-    for (int i = 0; i < workers_count; i++) {
-        free(workers[i]);
-    }
-    free(workers);
-    free(inpData.bloknot);
-
-    write(ofd, output, inpData.size);
-    close(ofd);
-    free(output);
+    
+    munmap(inputData, data.fileSize);    
+    return EXIT_SUCCESS;
 }
